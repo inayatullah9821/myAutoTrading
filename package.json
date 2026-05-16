@@ -1,0 +1,17 @@
+{
+  "name": "myautotrading",
+  "version": "1.0.0",
+  "main": "trade.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "ws": "^8.20.1"
+  }
+}
