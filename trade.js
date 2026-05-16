@@ -360,29 +360,82 @@ function pollForClose(bingxSym) {
 function fetchSeedCandles(symbol) {
   return new Promise((resolve, reject) => {
     const path = `/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${CONFIG.TIMEFRAME}&limit=${CONFIG.LOOKBACK + 1}`;
-    const req = https.request({ hostname: "api.binance.com", path, method: "GET" }, (res) => {
-      let d = "";
-      res.on("data", (c) => (d += c));
-      res.on("end", () => {
-        try {
-          const rows = JSON.parse(d);
-          const closed = rows.slice(0, -1).map((r) => ({
-            openTime: r[0],
-            open: parseFloat(r[1]),
-            high: parseFloat(r[2]),
-            low: parseFloat(r[3]),
-            close: parseFloat(r[4]),
-            volume: parseFloat(r[5])
-          }));
-          candleStore[symbol].push(...closed);
-          console.log(`📥 [${symbol.toUpperCase()}] Seeded ${closed.length} candles`);
-          resolve();
-        } catch (e) {
-          reject(e);
-        }
-      });
+
+    console.log(`📥 Fetching seed candles for ${symbol.toUpperCase()}`);
+    console.log(`🌐 URL: https://api.binance.com${path}`);
+
+    const req = https.request(
+      {
+        hostname: "api.binance.com",
+        path,
+        method: "GET"
+      },
+      (res) => {
+        console.log(`📡 BINANCE STATUS: ${res.statusCode}`);
+        console.log("📡 BINANCE HEADERS:", res.headers);
+
+        let d = "";
+
+        res.on("data", (c) => {
+          d += c;
+        });
+
+        res.on("end", () => {
+          console.log("\n================ BINANCE RESPONSE ================");
+          console.log(d);
+          console.log("==================================================\n");
+
+          try {
+            const rows = JSON.parse(d);
+
+            console.log("🔍 TYPE:", typeof rows);
+            console.log("🔍 IS ARRAY:", Array.isArray(rows));
+
+            // If Binance did NOT return candle array
+            if (!Array.isArray(rows)) {
+              console.log("\n❌ Binance returned NON-ARRAY response");
+              console.log("❌ Full Parsed Response:");
+              console.log(rows);
+              console.log("=====================================\n");
+
+              return reject(new Error("Binance returned non-array response"));
+            }
+
+            const closed = rows.slice(0, -1).map((r) => ({
+              openTime: r[0],
+              open: parseFloat(r[1]),
+              high: parseFloat(r[2]),
+              low: parseFloat(r[3]),
+              close: parseFloat(r[4]),
+              volume: parseFloat(r[5])
+            }));
+
+            candleStore[symbol].push(...closed);
+
+            console.log(`✅ [${symbol.toUpperCase()}] Seeded ${closed.length} candles`);
+
+            resolve();
+          } catch (e) {
+            console.log("\n=========== PARSE ERROR ===========");
+            console.log("❌ ERROR:", e.message);
+            console.log("❌ RAW BODY:");
+            console.log(d);
+            console.log("===================================\n");
+
+            reject(e);
+          }
+        });
+      }
+    );
+
+    req.on("error", (err) => {
+      console.log("\n=========== REQUEST ERROR ===========");
+      console.log(err);
+      console.log("=====================================\n");
+
+      reject(err);
     });
-    req.on("error", reject);
+
     req.end();
   });
 }
