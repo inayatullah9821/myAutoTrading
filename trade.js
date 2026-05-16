@@ -1,30 +1,35 @@
 // ============================================================
-//  BingX Auto Trade Bot — BTC-USDT
-//  Run: node trade.js        → DEMO mode (safe)
-//  Run: node trade.js live   → LIVE mode (real money)
+//  BingX Auto Trade Bot — LIVE ONLY
+//  Run: node trade.js
 // ============================================================
 
 require("dotenv").config();
+
 const WebSocket = require("ws");
 const https = require("https");
 const crypto = require("crypto");
 
 // ─────────────────────────────────────────
-//  CONFIG
+// CONFIG
 // ─────────────────────────────────────────
 const CONFIG = {
   TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID: process.env.TELEGRAM_CHAT_ID,
+
   BINGX_API_KEY: process.env.BINGX_API_KEY,
   BINGX_API_SECRET: process.env.BINGX_API_SECRET,
 
   SYMBOLS: ["BTC-USDT"],
-  TIMEFRAME: "5m",
+
+  TIMEFRAME: process.env.TIMEFRAME || "5m",
+
+  // REAL TRADE RISK
   RISK_USDT: 2,
   RR: 3,
-  LAST_CLOSE_COOLDOWN_MS: 15 * 60 * 1000, // 15 min after last CLOSED trade
 
-  // Detection — identical to alert script
+  LAST_CLOSE_COOLDOWN_MS: 15 * 60 * 1000,
+
+  // DETECTION SETTINGS
   LOOKBACK: 4,
   BODY_MULTIPLIER: 2.0,
   MIN_BODY_PCT: 0.1,
@@ -35,110 +40,184 @@ const CONFIG = {
 
   MIN_QTY: 0.0001,
   QTY_PRECISION: 4,
-  PRICE_PRECISION: 1
+  PRICE_PRECISION: 1,
+
+  // ───── TEST ORDER ─────
+  TEST_ORDER: process.env.TEST_ORDER === "true" ? true : false,
+
+  TEST_LEVERAGE: 150,
+  TEST_QTY: 0.0001,
+  TEST_SL_DIST: 50,
+  TEST_TP_DIST: 50
 };
 
 // ─────────────────────────────────────────
-//  MODE
+// LIVE ONLY
 // ─────────────────────────────────────────
-const MODE = process.argv[2] === "live" ? "live" : "demo";
-const BINGX_BASE = MODE === "live" ? "open-api.bingx.com" : "open-api-vst.bingx.com";
+const MODE = "LIVE";
+const BINGX_BASE = "open-api.bingx.com";
 
-console.log(`\n🤖 Trade Bot starting in ${MODE.toUpperCase()} mode`);
-console.log(`📡 BingX: ${BINGX_BASE}\n`);
+console.log(`\n🤖 Trade Bot starting in LIVE mode`);
+console.log(`📡 BingX host: ${BINGX_BASE}\n`);
 
 // ─────────────────────────────────────────
-//  STATE
+// STATE
 // ─────────────────────────────────────────
-const candleStore = {}; // binance symbol → candles[]
-const lastCloseTime = {}; // bingx symbol   → timestamp of last CLOSED trade
-const openOrderIds = {}; // bingx symbol   → orderId if trade currently open
+const candleStore = {};
+const lastCloseTime = {};
+const openOrderIds = {};
 
 CONFIG.SYMBOLS.forEach((s) => {
   const bSym = s.replace("-", "").toLowerCase();
+
   candleStore[bSym] = [];
   lastCloseTime[s] = 0;
   openOrderIds[s] = null;
 });
 
 // ─────────────────────────────────────────
-//  HELPERS
+// HELPERS
 // ─────────────────────────────────────────
 const bodySize = (c) => Math.abs(c.close - c.open);
+
 const bodyPct = (c) => (bodySize(c) / c.open) * 100;
+
 const isBullish = (c) => c.close > c.open;
+
 const isBearish = (c) => c.close < c.open;
+
 const avg = (arr) => arr.reduce((a, b) => a + b, 0) / arr.length;
-const toIST = (ts) => new Date(ts).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", hour12: true });
+
 const round = (v, d) => parseFloat(v.toFixed(d));
 
-// ─────────────────────────────────────────
-//  BINGX SIGNATURE
-// ─────────────────────────────────────────
-function buildQueryAndSign(params) {
-  params.timestamp = Date.now();
-  const qs = Object.keys(params)
-    .sort()
-    .map((k) => `${k}=${params[k]}`)
-    .join("&");
-  const sig = crypto.createHmac("sha256", CONFIG.BINGX_API_SECRET).update(qs).digest("hex");
-  return `${qs}&signature=${sig}`;
-}
+const toIST = (ts) =>
+  new Date(ts).toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    hour12: true
+  });
 
 // ─────────────────────────────────────────
-//  BINGX REST
+// SERVER TIME SYNC
 // ─────────────────────────────────────────
-function bingxRequest(method, path, params) {
-  return new Promise((resolve, reject) => {
-    const qs = buildQueryAndSign(params);
-    const opts = {
-      hostname: BINGX_BASE,
-      path: `${path}?${qs}`,
-      method,
-      headers: { "X-BX-APIKEY": CONFIG.BINGX_API_KEY }
-    };
-    const req = https.request(opts, (res) => {
-      let d = "";
-      res.on("data", (c) => (d += c));
-      res.on("end", () => {
-        try {
-          resolve(JSON.parse(d));
-        } catch (e) {
-          reject(new Error(`JSON parse: ${d}`));
-        }
-      });
-    });
-    req.on("error", reject);
+let serverTimeOffset = 0;
+
+async function syncServerTime() {
+  return new Promise((resolve) => {
+    const req = https.request(
+      {
+        hostname: BINGX_BASE,
+        path: "/openApi/swap/v2/server/time",
+        method: "GET"
+      },
+      (res) => {
+        let d = "";
+
+        res.on("data", (c) => (d += c));
+
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(d);
+
+            const serverTime = json.data?.serverTime || json.serverTime;
+
+            if (serverTime) {
+              serverTimeOffset = serverTime - Date.now();
+
+              console.log(`🕒 Server time synced. Offset: ${serverTimeOffset}ms`);
+            }
+          } catch (e) {
+            console.warn("⚠️ Time sync failed");
+          }
+
+          resolve();
+        });
+      }
+    );
+
+    req.on("error", () => resolve());
+
     req.end();
   });
 }
 
 // ─────────────────────────────────────────
-//  CHECK IF TRADE IS STILL OPEN on BingX
-//  Returns true if position exists for symbol
+// SIGNATURE
 // ─────────────────────────────────────────
-async function isTradeOpen(bingxSym) {
-  try {
-    const res = await bingxRequest("GET", "/openApi/swap/v2/trade/openOrders", {
-      symbol: bingxSym
-    });
-    if (res.code !== 0) return false;
-    const orders = res.data?.orders || [];
-    // Also check open positions
-    const posRes = await bingxRequest("GET", "/openApi/swap/v2/user/positions", {
-      symbol: bingxSym
-    });
-    const positions = posRes.data || [];
-    const hasPos = positions.some((p) => p.symbol === bingxSym && parseFloat(p.positionAmt) !== 0);
-    return hasPos || orders.length > 0;
-  } catch (e) {
-    console.error("isTradeOpen error:", e.message);
-    return false; // if check fails, allow trade
-  }
+function buildQueryAndSign(params) {
+  params.timestamp = Date.now() + serverTimeOffset;
+
+  // RAW query for signature
+  const rawQuery = Object.keys(params)
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join("&");
+
+  // SIGN RAW
+  const signature = crypto.createHmac("sha256", CONFIG.BINGX_API_SECRET).update(rawQuery).digest("hex");
+
+  // ENCODE ONLY FOR URL
+  const encodedQuery = Object.keys(params)
+    .sort()
+    .map((k) => {
+      return `${k}=${encodeURIComponent(params[k])}`;
+    })
+    .join("&");
+
+  return `${encodedQuery}&signature=${signature}`;
 }
 
 // ─────────────────────────────────────────
-//  TELEGRAM
+// BINGX REQUEST
+// ─────────────────────────────────────────
+function bingxRequest(method, path, params = {}) {
+  return new Promise((resolve, reject) => {
+    const qs = buildQueryAndSign(params);
+
+    const options = {
+      hostname: BINGX_BASE,
+      path: `${path}?${qs}`,
+      method,
+      headers: {
+        "X-BX-APIKEY": CONFIG.BINGX_API_KEY
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let d = "";
+
+      res.on("data", (c) => (d += c));
+
+      res.on("end", () => {
+        console.log(`📡 STATUS: ${res.statusCode} | PATH: ${path}`);
+
+        if (!d || !d.trim()) {
+          console.error(`📦 RAW: [EMPTY]`);
+
+          return reject(new Error(`Empty response (HTTP ${res.statusCode})`));
+        }
+
+        console.log(`📦 RAW: ${d}`);
+
+        try {
+          const parsed = JSON.parse(d);
+
+          console.log(`🔍 PARSED:`, JSON.stringify(parsed, null, 2));
+
+          resolve(parsed);
+        } catch (e) {
+          reject(new Error(`JSON parse error: ${d}`));
+        }
+      });
+    });
+
+    req.on("error", reject);
+
+    req.end();
+  });
+}
+
+// ─────────────────────────────────────────
+// TELEGRAM
 // ─────────────────────────────────────────
 function sendTelegram(msg) {
   const body = JSON.stringify({
@@ -146,260 +225,421 @@ function sendTelegram(msg) {
     text: msg,
     parse_mode: "HTML"
   });
-  const opts = {
+
+  const options = {
     hostname: "api.telegram.org",
     path: `/bot${CONFIG.TELEGRAM_BOT_TOKEN}/sendMessage`,
     method: "POST",
-    headers: { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }
+    headers: {
+      "Content-Type": "application/json",
+      "Content-Length": Buffer.byteLength(body)
+    }
   };
-  const req = https.request(opts, (res) => {
-    let d = "";
-    res.on("data", (c) => (d += c));
-    res.on("end", () => {
-      const p = JSON.parse(d);
-      if (!p.ok) console.error("TG:", p.description);
-    });
+
+  const req = https.request(options);
+
+  req.on("error", (e) => {
+    console.error("TG error:", e.message);
   });
-  req.on("error", (e) => console.error("TG error:", e.message));
+
   req.write(body);
+
   req.end();
 }
 
 // ─────────────────────────────────────────
-//  PATTERN DETECTION — identical to index.js
+// FETCH BTC PRICE
+// ─────────────────────────────────────────
+async function fetchBTCPrice() {
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        hostname: "fapi.binance.com",
+        path: "/fapi/v1/ticker/price?symbol=BTCUSDT",
+        method: "GET"
+      },
+      (res) => {
+        let d = "";
+
+        res.on("data", (c) => (d += c));
+
+        res.on("end", () => {
+          try {
+            const json = JSON.parse(d);
+
+            resolve(parseFloat(json.price));
+          } catch (e) {
+            reject(e);
+          }
+        });
+      }
+    );
+
+    req.on("error", reject);
+
+    req.end();
+  });
+}
+
+// ─────────────────────────────────────────
+// TEST ORDER
+// ─────────────────────────────────────────
+async function placeTestOrder() {
+  console.log("\n🧪 STARTUP TEST ORDER\n");
+
+  try {
+    // ───── SET LEVERAGE ─────
+    const levRes = await bingxRequest("POST", "/openApi/swap/v2/trade/leverage", {
+      symbol: "BTC-USDT",
+      side: "SHORT",
+      leverage: String(CONFIG.TEST_LEVERAGE)
+    });
+
+    if (levRes.code === 0) {
+      console.log(`✅ Leverage set to ${CONFIG.TEST_LEVERAGE}x`);
+    }
+
+    // ───── PRICE ─────
+    const currentPrice = await fetchBTCPrice();
+
+    console.log(`💰 BTC price: ${currentPrice}`);
+
+    // ───── TEST ORDER ─────
+    const slPrice = round(currentPrice + CONFIG.TEST_SL_DIST, CONFIG.PRICE_PRECISION);
+
+    const tpPrice = round(currentPrice - CONFIG.TEST_TP_DIST, CONFIG.PRICE_PRECISION);
+
+    console.log(`📋 SELL SHORT ${CONFIG.TEST_QTY} BTC | Entry ~$${currentPrice} | SL $${slPrice} | TP $${tpPrice}`);
+
+    const params = {
+      symbol: "BTC-USDT",
+      side: "SELL",
+      positionSide: "SHORT",
+      type: "MARKET",
+      quantity: CONFIG.TEST_QTY,
+
+      stopLoss: JSON.stringify({
+        type: "STOP_MARKET",
+        stopPrice: slPrice,
+        price: slPrice,
+        workingType: "MARK_PRICE"
+      }),
+
+      takeProfit: JSON.stringify({
+        type: "TAKE_PROFIT_MARKET",
+        stopPrice: tpPrice,
+        price: tpPrice,
+        workingType: "MARK_PRICE"
+      })
+    };
+
+    const res = await bingxRequest("POST", "/openApi/swap/v2/trade/order", params);
+
+    if (res.code === 0) {
+      const orderId = res.data?.order?.orderId || res.data?.orderId || "N/A";
+
+      console.log(`✅ TEST ORDER SUCCESS`);
+
+      sendTelegram(`🧪 <b>STARTUP TEST ORDER SUCCESS</b>\n\n` + `🔴 SHORT BTC-USDT\n` + `📦 Qty: ${CONFIG.TEST_QTY}\n` + `💰 Entry: ${currentPrice}\n` + `🛑 SL: ${slPrice}\n` + `🎯 TP: ${tpPrice}\n` + `🔖 OrderId: ${orderId}`);
+    } else {
+      console.error(`❌ TEST ORDER FAILED: ${res.code} ${res.msg}`);
+
+      sendTelegram(`❌ <b>TEST ORDER FAILED</b>\n${res.code} ${res.msg}`);
+    }
+  } catch (e) {
+    console.error(`❌ Test order exception: ${e.message}`);
+
+    sendTelegram(`❌ <b>TEST ORDER EXCEPTION</b>\n${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────
+// DETECTION LOGIC
 // ─────────────────────────────────────────
 function detect(candles) {
-  if (candles.length < CONFIG.LOOKBACK + 1) return null;
+  if (candles.length < CONFIG.LOOKBACK + 1) {
+    return null;
+  }
 
   const prev = candles.slice(-(CONFIG.LOOKBACK + 1), -1);
+
   const current = candles[candles.length - 1];
 
   const avgBody = avg(prev.map(bodySize));
+
   const avgVol = avg(prev.map((c) => c.volume));
+
   const curBody = bodySize(current);
+
   const curVol = current.volume;
 
-  if (bodyPct(current) < CONFIG.MIN_BODY_PCT) return null;
-  if (curBody < avgBody * CONFIG.BODY_MULTIPLIER) return null;
-  if (curVol < avgVol * CONFIG.VOLUME_MULTIPLIER) return null;
+  if (bodyPct(current) < CONFIG.MIN_BODY_PCT) {
+    return null;
+  }
+
+  if (curBody < avgBody * CONFIG.BODY_MULTIPLIER) {
+    return null;
+  }
+
+  if (curVol < avgVol * CONFIG.VOLUME_MULTIPLIER) {
+    return null;
+  }
 
   const highs = prev.map((c) => c.high);
+
   const lows = prev.map((c) => c.low);
+
   const hiMax = Math.max(...highs);
+
   const loMin = Math.min(...lows);
+
   const rangePct = ((hiMax - loMin) / loMin) * 100;
+
   const isSideways = rangePct < CONFIG.RANGE_THRESHOLD;
 
   const topLevel = Math.max(...prev.map((c) => Math.max(c.open, c.close)));
+
   const botLevel = Math.min(...prev.map((c) => Math.min(c.open, c.close)));
 
   const touchingLevel = (c, level) => {
     const pct = CONFIG.CLUSTER_ZONE_PCT / 100;
+
     return Math.abs(c.open - level) / level < pct || Math.abs(c.close - level) / level < pct;
   };
 
   const touchTop = prev.filter((c) => touchingLevel(c, topLevel)).length;
+
   const touchBot = prev.filter((c) => touchingLevel(c, botLevel)).length;
+
   const isLevelHeld = touchTop >= CONFIG.CLUSTER_TOUCH_MIN || touchBot >= CONFIG.CLUSTER_TOUCH_MIN;
 
-  if (!isSideways && !isLevelHeld) return null;
+  if (!isSideways && !isLevelHeld) {
+    return null;
+  }
 
   const bullish = isBullish(current) && current.close > topLevel;
+
   const bearish = isBearish(current) && current.close < botLevel;
-  if (!bullish && !bearish) return null;
+
+  if (!bullish && !bearish) {
+    return null;
+  }
 
   return {
     direction: bullish ? "BULLISH" : "BEARISH",
     pattern: isSideways ? "Sideways Breakout" : "Level Break Momentum",
+
     candle: current,
+
     entry: current.close,
+
     sl: bullish ? current.low : current.high,
+
     bodyPct: bodyPct(current).toFixed(3),
+
     bodyVsAvg: (curBody / avgBody).toFixed(1),
+
     volVsAvg: (curVol / avgVol).toFixed(1),
+
     rangePct: rangePct.toFixed(3)
   };
 }
 
 // ─────────────────────────────────────────
-//  POSITION SIZE
+// POSITION SIZE
 // ─────────────────────────────────────────
 function calcQty(entry, sl) {
   const dist = Math.abs(entry - sl);
+
   if (!dist) return null;
+
   const qty = round(CONFIG.RISK_USDT / dist, CONFIG.QTY_PRECISION);
+
   return qty < CONFIG.MIN_QTY ? CONFIG.MIN_QTY : qty;
 }
 
 // ─────────────────────────────────────────
-//  PLACE ORDER
+// CHECK TRADE OPEN
+// ─────────────────────────────────────────
+async function isTradeOpen(symbol) {
+  try {
+    const res = await bingxRequest("GET", "/openApi/swap/v2/user/positions", {
+      symbol
+    });
+
+    const positions = res.data || [];
+
+    return positions.some((p) => {
+      return p.symbol === symbol && parseFloat(p.positionAmt) !== 0;
+    });
+  } catch (e) {
+    console.error("isTradeOpen:", e.message);
+
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────
+// PLACE ORDER
 // ─────────────────────────────────────────
 async function placeOrder(signal, bingxSym) {
   const { direction, entry, sl } = signal;
+
   const qty = calcQty(entry, sl);
+
   if (!qty) {
-    console.error("SL distance 0, skip");
     return null;
   }
 
   const slDist = Math.abs(entry - sl);
+
   const tp = direction === "BULLISH" ? round(entry + CONFIG.RR * slDist, CONFIG.PRICE_PRECISION) : round(entry - CONFIG.RR * slDist, CONFIG.PRICE_PRECISION);
+
   const slPrice = round(sl, CONFIG.PRICE_PRECISION);
 
   const params = {
     symbol: bingxSym,
+
     side: direction === "BULLISH" ? "BUY" : "SELL",
+
     positionSide: direction === "BULLISH" ? "LONG" : "SHORT",
+
     type: "MARKET",
+
     quantity: qty,
-    stopLoss: JSON.stringify({ type: "STOP_MARKET", stopPrice: slPrice, price: slPrice, workingType: "MARK_PRICE" }),
-    takeProfit: JSON.stringify({ type: "TAKE_PROFIT_MARKET", stopPrice: tp, price: tp, workingType: "MARK_PRICE" })
+
+    stopLoss: JSON.stringify({
+      type: "STOP_MARKET",
+      stopPrice: slPrice,
+      price: slPrice,
+      workingType: "MARK_PRICE"
+    }),
+
+    takeProfit: JSON.stringify({
+      type: "TAKE_PROFIT_MARKET",
+      stopPrice: tp,
+      price: tp,
+      workingType: "MARK_PRICE"
+    })
   };
 
-  console.log(`\n📤 Placing ${MODE.toUpperCase()} order | ${direction} ${qty} ${bingxSym} SL:${slPrice} TP:${tp}`);
+  console.log(`\n📤 LIVE ORDER | ${direction} ${qty} ${bingxSym}`);
 
   try {
     const res = await bingxRequest("POST", "/openApi/swap/v2/trade/order", params);
+
     if (res.code === 0) {
-      const orderId = res.data?.order?.orderId || "N/A";
-      console.log(`✅ Order placed! orderId: ${orderId}`);
-      return { qty, slPrice, tp, orderId, slDist };
-    } else {
-      console.error(`❌ BingX ${res.code}: ${res.msg}`);
-      sendTelegram(`❌ <b>Order failed</b> — ${bingxSym}\n${res.code}: ${res.msg}`);
-      return null;
+      const orderId = res.data?.order?.orderId || res.data?.orderId || "N/A";
+
+      return {
+        qty,
+        tp,
+        slPrice,
+        orderId
+      };
     }
+
+    console.error(`❌ ORDER FAILED: ${res.code} ${res.msg}`);
+
+    return null;
   } catch (e) {
-    console.error("Order error:", e.message);
-    sendTelegram(`❌ <b>Order error</b> — ${bingxSym}\n${e.message}`);
+    console.error(`❌ ORDER ERROR: ${e.message}`);
+
     return null;
   }
 }
 
 // ─────────────────────────────────────────
-//  HANDLE SIGNAL
+// HANDLE SIGNAL
 // ─────────────────────────────────────────
 async function handleSignal(binanceSym, signal) {
   const bingxSym = binanceSym.replace("usdt", "-USDT").toUpperCase();
+
   const now = Date.now();
 
-  // ── Guard 1: Is a trade already open on BingX?
   const tradeOpen = await isTradeOpen(bingxSym);
+
   if (tradeOpen) {
-    console.log(`⏭ [${bingxSym}] Trade already open — skipping signal`);
-    sendTelegram(`⏭ <b>Signal detected but skipped — ${bingxSym}</b>\n` + `Reason: Trade already open\n` + `${signal.direction === "BULLISH" ? "🟢" : "🔴"} ${signal.direction} | ${signal.pattern}\n` + `💰 Entry: ${signal.entry} | 🕒 ${toIST(signal.candle.openTime)}`);
+    console.log(`⏭ ${bingxSym} trade already open`);
+
     return;
   }
 
-  // ── Guard 2: Last closed trade was less than 15 min ago?
   if (now - lastCloseTime[bingxSym] < CONFIG.LAST_CLOSE_COOLDOWN_MS) {
-    const minsAgo = Math.round((now - lastCloseTime[bingxSym]) / 60000);
-    console.log(`⏭ [${bingxSym}] Last trade closed ${minsAgo}m ago — cooldown active`);
-    sendTelegram(`⏭ <b>Signal detected but skipped — ${bingxSym}</b>\n` + `Reason: Last trade closed ${minsAgo}m ago (cooldown 15m)\n` + `${signal.direction === "BULLISH" ? "🟢" : "🔴"} ${signal.direction} | ${signal.pattern}\n` + `💰 Entry: ${signal.entry} | 🕒 ${toIST(signal.candle.openTime)}`);
+    console.log(`⏭ ${bingxSym} cooldown active`);
+
     return;
   }
 
-  // ── Place order
   const order = await placeOrder(signal, bingxSym);
-  const modeTag = MODE === "demo" ? "🧪 DEMO" : "💰 LIVE";
+
+  if (!order) {
+    sendTelegram(`❌ <b>ORDER FAILED</b>\n${bingxSym}`);
+
+    return;
+  }
+
   const dir = signal.direction === "BULLISH" ? "🟢 BULLISH" : "🔴 BEARISH";
 
-  const msg = order
-    ? `<b>${modeTag} — TRADE PLACED 🚀 ${bingxSym}</b>
-${dir} | ${signal.pattern}
+  const msg = `<b>🚀 TRADE PLACED — ${bingxSym}</b>\n\n` + `${dir} | ${signal.pattern}\n\n` + `💰 Entry: ${signal.entry}\n` + `🛑 SL: ${order.slPrice}\n` + `🎯 TP: ${order.tp}\n` + `📦 Qty: ${order.qty}\n` + `💵 Risk: $${CONFIG.RISK_USDT}\n` + `🔖 OrderId: ${order.orderId}`;
 
-💰 <b>Entry:</b> ${signal.entry}
-🛑 <b>Stop Loss:</b> ${order.slPrice}
-🎯 <b>Target (${CONFIG.RR}R):</b> ${order.tp}
-📦 <b>Qty:</b> ${order.qty} BTC
-💵 <b>Risk:</b> $${CONFIG.RISK_USDT}
-📊 <b>Body:</b> ${signal.bodyPct}% | ${signal.bodyVsAvg}x avg
-📦 <b>Volume:</b> ${signal.volVsAvg}x avg
-🕒 <b>Candle:</b> ${toIST(signal.candle.openTime)}
-🔖 <b>OrderId:</b> ${order.orderId}`
-    : `<b>⚠️ Signal detected — order FAILED — ${bingxSym}</b>\n${dir} | Entry: ${signal.entry}`;
-
-  console.log("\n" + "=".repeat(55));
+  console.log("\n" + "=".repeat(60));
   console.log(msg.replace(/<[^>]+>/g, ""));
-  console.log("=".repeat(55));
+  console.log("=".repeat(60));
+
   sendTelegram(msg);
 
-  // Mark trade as open — will be cleared when position closes
-  if (order) {
-    openOrderIds[bingxSym] = order.orderId;
-    // Poll every 30s to detect when position closes, then update lastCloseTime
-    pollForClose(bingxSym);
-  }
+  openOrderIds[bingxSym] = order.orderId;
+
+  pollForClose(bingxSym);
 }
 
 // ─────────────────────────────────────────
-//  POLL FOR POSITION CLOSE
-//  Checks every 30s if position is still open
-//  When closed → sets lastCloseTime
+// POLL FOR CLOSE
 // ─────────────────────────────────────────
 function pollForClose(bingxSym) {
   const interval = setInterval(async () => {
     try {
       const stillOpen = await isTradeOpen(bingxSym);
+
       if (!stillOpen) {
-        console.log(`✅ [${bingxSym}] Position closed — starting 15m cooldown`);
+        console.log(`✅ ${bingxSym} position closed`);
+
         lastCloseTime[bingxSym] = Date.now();
+
         openOrderIds[bingxSym] = null;
+
         clearInterval(interval);
-        sendTelegram(`✅ <b>Position closed — ${bingxSym}</b>\n15 min cooldown started`);
+
+        sendTelegram(`✅ <b>POSITION CLOSED</b>\n${bingxSym}\nCooldown started`);
       }
     } catch (e) {
-      console.error("pollForClose error:", e.message);
+      console.error("pollForClose:", e.message);
     }
-  }, 30 * 1000); // check every 30 seconds
+  }, 30000);
 }
 
 // ─────────────────────────────────────────
-//  SEED CANDLES
+// SEED CANDLES
 // ─────────────────────────────────────────
 function fetchSeedCandles(symbol) {
   return new Promise((resolve, reject) => {
-    const path = `/api/v3/klines?symbol=${symbol.toUpperCase()}&interval=${CONFIG.TIMEFRAME}&limit=${CONFIG.LOOKBACK + 1}`;
-
-    console.log(`📥 Fetching seed candles for ${symbol.toUpperCase()}`);
-    console.log(`🌐 URL: https://api.binance.com${path}`);
+    const path = `/fapi/v1/klines?symbol=${symbol.toUpperCase()}` + `&interval=${CONFIG.TIMEFRAME}` + `&limit=${CONFIG.LOOKBACK + 1}`;
 
     const req = https.request(
       {
-        hostname: "api.binance.com",
+        hostname: "fapi.binance.com",
         path,
         method: "GET"
       },
       (res) => {
-        console.log(`📡 BINANCE STATUS: ${res.statusCode}`);
-        console.log("📡 BINANCE HEADERS:", res.headers);
-
         let d = "";
 
-        res.on("data", (c) => {
-          d += c;
-        });
+        res.on("data", (c) => (d += c));
 
         res.on("end", () => {
-          console.log("\n================ BINANCE RESPONSE ================");
-          console.log(d);
-          console.log("==================================================\n");
-
           try {
             const rows = JSON.parse(d);
-
-            console.log("🔍 TYPE:", typeof rows);
-            console.log("🔍 IS ARRAY:", Array.isArray(rows));
-
-            // If Binance did NOT return candle array
-            if (!Array.isArray(rows)) {
-              console.log("\n❌ Binance returned NON-ARRAY response");
-              console.log("❌ Full Parsed Response:");
-              console.log(rows);
-              console.log("=====================================\n");
-
-              return reject(new Error("Binance returned non-array response"));
-            }
 
             const closed = rows.slice(0, -1).map((r) => ({
               openTime: r[0],
@@ -412,56 +652,59 @@ function fetchSeedCandles(symbol) {
 
             candleStore[symbol].push(...closed);
 
-            console.log(`✅ [${symbol.toUpperCase()}] Seeded ${closed.length} candles`);
+            console.log(`📥 ${symbol.toUpperCase()} seeded`);
 
             resolve();
           } catch (e) {
-            console.log("\n=========== PARSE ERROR ===========");
-            console.log("❌ ERROR:", e.message);
-            console.log("❌ RAW BODY:");
-            console.log(d);
-            console.log("===================================\n");
-
             reject(e);
           }
         });
       }
     );
 
-    req.on("error", (err) => {
-      console.log("\n=========== REQUEST ERROR ===========");
-      console.log(err);
-      console.log("=====================================\n");
-
-      reject(err);
-    });
+    req.on("error", reject);
 
     req.end();
   });
 }
 
 // ─────────────────────────────────────────
-//  WEBSOCKET
+// START WEBSOCKET
 // ─────────────────────────────────────────
 async function startWebSocket() {
   const binanceSyms = CONFIG.SYMBOLS.map((s) => s.replace("-", "").toLowerCase());
+
+  await syncServerTime();
+
+  // ───── TEST ORDER ─────
+  if (CONFIG.TEST_ORDER) {
+    await placeTestOrder();
+  }
+
   await Promise.all(binanceSyms.map(fetchSeedCandles));
+
   console.log("✅ Seed complete. Connecting...\n");
 
-  const ws = new WebSocket(`wss://stream.binance.com:9443/stream?streams=${binanceSyms.map((s) => `${s}@kline_${CONFIG.TIMEFRAME}`).join("/")}`);
+  const ws = new WebSocket(`wss://fstream.binance.com/stream?streams=${binanceSyms.map((s) => `${s}@kline_${CONFIG.TIMEFRAME}`).join("/")}`);
 
   ws.on("open", () => {
-    console.log("✅ Connected.\n");
-    sendTelegram(`🤖 <b>Trade Bot — ${MODE.toUpperCase()}</b>\n` + `Symbols: ${CONFIG.SYMBOLS.join(", ")} | TF: ${CONFIG.TIMEFRAME}\n` + `Risk: $${CONFIG.RISK_USDT} | Target: ${CONFIG.RR}R`);
+    console.log("✅ WS connected.");
+
+    sendTelegram(`🤖 <b>Trade Bot Started</b>\n` + `Mode: LIVE\n` + `Symbols: ${CONFIG.SYMBOLS.join(", ")}`);
   });
 
   ws.on("message", async (raw) => {
     try {
       const msg = JSON.parse(raw);
-      const kline = msg.data?.k;
-      if (!kline || !kline.x) return;
+
+      const kline = msg.data?.k || msg.k;
+
+      if (!kline || !kline.x) {
+        return;
+      }
 
       const sym = kline.s.toLowerCase();
+
       const candle = {
         openTime: kline.t,
         open: parseFloat(kline.o),
@@ -472,35 +715,50 @@ async function startWebSocket() {
       };
 
       candleStore[sym].push(candle);
-      if (candleStore[sym].length > 50) candleStore[sym].shift();
 
-      console.log(`[${sym.toUpperCase()}] ${toIST(candle.openTime)} | C: ${candle.close}`);
+      if (candleStore[sym].length > 50) {
+        candleStore[sym].shift();
+      }
+
+      console.log(`[${sym.toUpperCase()}] ${toIST(candle.openTime)} | Close: ${candle.close}`);
 
       const signal = detect(candleStore[sym]);
-      if (signal) await handleSignal(sym, signal);
+
+      if (signal) {
+        await handleSignal(sym, signal);
+      }
     } catch (e) {
-      console.error("Msg error:", e.message);
+      console.error("WS msg:", e.message);
     }
   });
 
   ws.on("close", () => {
-    console.warn("WS closed. Reconnecting...");
+    console.warn("⚠️ WS disconnected. Reconnecting...");
+
     setTimeout(startWebSocket, 5000);
   });
+
   ws.on("error", (err) => {
     console.error("WS error:", err.message);
+
     ws.terminate();
   });
 }
 
 // ─────────────────────────────────────────
-//  VALIDATE & START
+// VALIDATE ENV
 // ─────────────────────────────────────────
 const required = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "BINGX_API_KEY", "BINGX_API_SECRET"];
+
 const missing = required.filter((k) => !CONFIG[k]);
+
 if (missing.length) {
-  console.error(`❌ Missing in .env: ${missing.join(", ")}`);
+  console.error(`❌ Missing ENV: ${missing.join(", ")}`);
+
   process.exit(1);
 }
 
+// ─────────────────────────────────────────
+// START
+// ─────────────────────────────────────────
 startWebSocket();
