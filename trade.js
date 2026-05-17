@@ -357,7 +357,18 @@ async function handleSignal(binanceSym, signal) {
   const now = Date.now();
 
   console.log(`\n🎯 SIGNAL | ${bingxSym} | ${signal.direction} | ${signal.pattern}`);
-  console.log(`   Entry: ${signal.entry} | SL: ${round(signal.sl, 1)} | Body: ${signal.bodyVsAvg}x | Vol: ${signal.volVsAvg}x`);
+  console.log(`   Spot entry: ${signal.entry} | Spot SL: ${round(signal.sl, 1)}`);
+
+  // Fetch futures price and adjust entry/SL/TP to futures prices
+  try {
+    const futuresPrice = await fetchBTCPrice();
+    const slDist = Math.abs(signal.entry - signal.sl);
+    signal.entry = futuresPrice;
+    signal.sl = signal.direction === "BULLISH" ? round(futuresPrice - slDist, 1) : round(futuresPrice + slDist, 1);
+    console.log(`   Futures entry: ${futuresPrice} | Futures SL: ${signal.sl} | SL dist: ${slDist.toFixed(1)}`);
+  } catch (e) {
+    console.warn(`⚠️ Futures price fetch failed, using spot prices: ${e.message}`);
+  }
 
   const tradeOpen = await isTradeOpen(bingxSym);
   if (tradeOpen) {
@@ -451,9 +462,9 @@ async function startWebSocket() {
 
   console.log("✅ Seed complete. Connecting to futures stream...\n");
 
-  // Binance futures combined stream — msg.data.k format
+  // Spot stream — works globally including India and Railway Singapore
   const streams = binanceSyms.map((s) => `${s}@kline_${CONFIG.TIMEFRAME}`).join("/");
-  const streamUrl = `wss://fstream.binance.com/stream?streams=${streams}`;
+  const streamUrl = `wss://stream.binance.com:9443/stream?streams=${streams}`;
   console.log(`🔗 ${streamUrl}`);
 
   const ws = new WebSocket(streamUrl);
@@ -464,7 +475,6 @@ async function startWebSocket() {
   });
 
   ws.on("message", async (raw) => {
-    console.log("📨", raw.toString().slice(0, 100)); // ADD THIS LINE
     try {
       const msg = JSON.parse(raw);
       const kline = msg.data?.k; // futures combined stream always uses msg.data.k
