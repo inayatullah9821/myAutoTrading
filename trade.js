@@ -464,6 +464,7 @@ async function startWebSocket() {
   });
 
   ws.on("message", async (raw) => {
+    console.log("📨", raw.toString().slice(0, 100)); // ADD THIS LINE
     try {
       const msg = JSON.parse(raw);
       const kline = msg.data?.k; // futures combined stream always uses msg.data.k
