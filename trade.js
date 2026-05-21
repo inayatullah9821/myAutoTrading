@@ -21,7 +21,7 @@ const CONFIG = {
   TIMEFRAME: process.env.TIMEFRAME || "5m",
 
   RISK_USDT: parseFloat(process.env.RISK_USDT || "1"), // FIX: was string, now number
-  RR: 3,
+  RR: parseFloat(process.env.RR || "1"),
 
   LAST_CLOSE_COOLDOWN_MS: 15 * 60 * 1000,
 
@@ -34,6 +34,7 @@ const CONFIG = {
   VOLUME_MULTIPLIER: 1.4,
 
   MIN_QTY: 0.0001,
+  MAX_QTY: 0.008,
   QTY_PRECISION: 4,
   PRICE_PRECISION: 1,
 
@@ -288,8 +289,11 @@ function detect(candles) {
 function calcQty(entry, sl) {
   const dist = Math.abs(entry - sl);
   if (!dist) return null;
+
   const qty = round(CONFIG.RISK_USDT / dist, CONFIG.QTY_PRECISION);
-  return qty < CONFIG.MIN_QTY ? CONFIG.MIN_QTY : qty;
+
+  // apply min/max caps
+  return Math.min(CONFIG.MAX_QTY, Math.max(CONFIG.MIN_QTY, qty));
 }
 
 // ─────────────────────────────────────────
